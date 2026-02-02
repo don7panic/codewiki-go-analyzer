@@ -7,6 +7,14 @@ import (
 	"testing"
 )
 
+func writeGoMod(t *testing.T, dir string) {
+	t.Helper()
+	content := "module example.com/test\n\ngo 1.25\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write go.mod: %v", err)
+	}
+}
+
 func TestAnalyzeStructSourceExtraction(t *testing.T) {
 	// 1. Setup temporary test file
 	content := `package testpkg
@@ -17,6 +25,7 @@ type MyStruct struct {
 }
 `
 	tmpDir := t.TempDir()
+	writeGoMod(t, tmpDir)
 	tmpFile := filepath.Join(tmpDir, "test_struct.go")
 	err := os.WriteFile(tmpFile, []byte(content), 0644)
 	if err != nil {
@@ -24,7 +33,7 @@ type MyStruct struct {
 	}
 
 	// 2. Run Analyzer
-	analyzer, err := NewGoAnalyzer(tmpFile, tmpDir)
+	analyzer, err := NewGoAnalyzer(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to create analyzer: %v", err)
 	}
@@ -65,13 +74,14 @@ func Submit(v int) {
 }
 `
 	tmpDir := t.TempDir()
+	writeGoMod(t, tmpDir)
 	tmpFile := filepath.Join(tmpDir, "test_func.go")
 	err := os.WriteFile(tmpFile, []byte(content), 0644)
 	if err != nil {
 		t.Fatalf("Failed to write temp file: %v", err)
 	}
 
-	analyzer, err := NewGoAnalyzer(tmpFile, tmpDir)
+	analyzer, err := NewGoAnalyzer(tmpDir)
 	if err != nil {
 		t.Fatalf("Failed to init analyzer: %v", err)
 	}
@@ -107,12 +117,13 @@ func Caller() {
 func Callee() {}
 `
 	tmpDir := t.TempDir()
+	writeGoMod(t, tmpDir)
 	tmpFile := filepath.Join(tmpDir, "test_calls.go")
 	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	analyzer, _ := NewGoAnalyzer(tmpFile, tmpDir)
+	analyzer, _ := NewGoAnalyzer(tmpDir)
 	analyzer.Analyze()
 
 	found := false
@@ -130,6 +141,99 @@ func Callee() {}
 	}
 }
 
+func TestAnalyzeMethodCalls(t *testing.T) {
+	content := `package testpkg
+
+type T struct{}
+
+func (t *T) A() {
+	t.B()
+}
+
+func (t *T) B() {}
+`
+	tmpDir := t.TempDir()
+	writeGoMod(t, tmpDir)
+	tmpFile := filepath.Join(tmpDir, "test_method_calls.go")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	analyzer, _ := NewGoAnalyzer(tmpDir)
+	analyzer.Analyze()
+
+	var resolved *bool
+	var callee string
+	for _, rel := range analyzer.Relationships {
+		if strings.Contains(rel.Caller, "A") && strings.Contains(rel.Callee, "B") {
+			r := rel.IsResolved
+			resolved = &r
+			callee = rel.Callee
+		}
+	}
+
+	if resolved == nil {
+		t.Error("Method call relationship A->B not found")
+	} else if !*resolved {
+		t.Errorf("Expected method call to be resolved (is_resolved=true), got callee %s", callee)
+	}
+
+	if callee != "" && !strings.Contains(callee, ".T.B") {
+		t.Errorf("Expected callee to include type-qualified method ('.T.B'), got %s", callee)
+	}
+}
+
+func TestAnalyzeCrossFileMethodCalls(t *testing.T) {
+	contentA := `package testpkg
+
+type A struct{}
+
+func (a *A) Foo() {
+	b := &B{}
+	b.Bar()
+}
+`
+	contentB := `package testpkg
+
+type B struct{}
+
+func (b *B) Bar() {}
+`
+	tmpDir := t.TempDir()
+	writeGoMod(t, tmpDir)
+	fileA := filepath.Join(tmpDir, "a.go")
+	fileB := filepath.Join(tmpDir, "b.go")
+	if err := os.WriteFile(fileA, []byte(contentA), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, []byte(contentB), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	analyzer, _ := NewGoAnalyzer(tmpDir)
+	analyzer.Analyze()
+
+	var resolved *bool
+	var callee string
+	for _, rel := range analyzer.Relationships {
+		if strings.Contains(rel.Caller, "Foo") && strings.Contains(rel.Callee, "Bar") {
+			r := rel.IsResolved
+			resolved = &r
+			callee = rel.Callee
+		}
+	}
+
+	if resolved == nil {
+		t.Error("Cross-file method call relationship Foo->Bar not found")
+	} else if !*resolved {
+		t.Errorf("Expected cross-file method call to be resolved (is_resolved=true), got callee %s", callee)
+	}
+
+	if callee != "" && !strings.Contains(callee, ".B.Bar") {
+		t.Errorf("Expected callee to include type-qualified method ('.B.Bar'), got %s", callee)
+	}
+}
+
 func TestIsResolved(t *testing.T) {
 	content := `package testpkg
 
@@ -141,12 +245,13 @@ func Caller() {
 func InternalFunc() {}
 `
 	tmpDir := t.TempDir()
+	writeGoMod(t, tmpDir)
 	tmpFile := filepath.Join(tmpDir, "test_resolved.go")
 	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	analyzer, _ := NewGoAnalyzer(tmpFile, tmpDir)
+	analyzer, _ := NewGoAnalyzer(tmpDir)
 	analyzer.Analyze()
 
 	var internalResolved, externalResolved *bool

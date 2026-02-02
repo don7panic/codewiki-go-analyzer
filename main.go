@@ -11,16 +11,15 @@ import (
 )
 
 func main() {
-	filePath := flag.String("file", "", "Path to the Go file to analyze")
 	repoPath := flag.String("repo", "", "Path to the repository root")
 	flag.Parse()
 
-	if *filePath == "" {
-		fmt.Println("Error: --file argument is required")
+	if *repoPath == "" {
+		fmt.Println("Error: --repo argument is required")
 		os.Exit(1)
 	}
 
-	an, err := analyzer.NewGoAnalyzer(*filePath, *repoPath)
+	an, err := analyzer.NewGoAnalyzer(*repoPath)
 	if err != nil {
 		fmt.Printf("Error creating analyzer: %v\n", err)
 		os.Exit(1)

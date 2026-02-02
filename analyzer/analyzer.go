@@ -5,35 +5,35 @@ package analyzer
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"golang.org/x/tools/go/packages"
 
 	"github.com/don7panic/codewiki-go-analyzer/models"
 )
 
 type GoAnalyzer struct {
-	FilePath         string
-	Content          []byte
 	RepoPath         string
+	RepoAbs          string
 	FileSet          *token.FileSet
 	Nodes            []models.Node
 	Relationships    []models.CallRelationship
-	PackageName      string
 	CollectedNodeIDs map[string]bool // Track collected node IDs for is_resolved
 }
 
-func NewGoAnalyzer(filePath string, repoPath string) (*GoAnalyzer, error) {
-	content, err := os.ReadFile(filePath)
+func NewGoAnalyzer(repoPath string) (*GoAnalyzer, error) {
+	repoAbs, err := filepath.Abs(repoPath)
 	if err != nil {
 		return nil, err
 	}
 
 	return &GoAnalyzer{
-		FilePath:         filePath,
-		Content:          content,
 		RepoPath:         repoPath,
+		RepoAbs:          repoAbs,
 		FileSet:          token.NewFileSet(),
 		Nodes:            []models.Node{},
 		Relationships:    []models.CallRelationship{},
@@ -42,74 +42,117 @@ func NewGoAnalyzer(filePath string, repoPath string) (*GoAnalyzer, error) {
 }
 
 func (a *GoAnalyzer) Analyze() error {
-	f, err := parser.ParseFile(a.FileSet, a.FilePath, a.Content, parser.ParseComments)
+	moduleRoots, err := a.findModuleRoots()
 	if err != nil {
 		return err
 	}
+	if len(moduleRoots) == 0 {
+		moduleRoots = []string{a.RepoAbs}
+	}
 
-	a.PackageName = f.Name.Name
+	fileInfos := map[string]*fileInfo{}
 
-	// First pass: Collect nodes (Structs, Interfaces, Functions, Methods)
-	ast.Inspect(f, func(n ast.Node) bool {
-		switch x := n.(type) {
-		case *ast.GenDecl:
-			if x.Tok == token.TYPE {
-				for _, spec := range x.Specs {
-					if ts, ok := spec.(*ast.TypeSpec); ok {
-						a.visitTypeSpec(ts, x.Doc)
-					}
+	for _, root := range moduleRoots {
+		pkgs, loadErr := a.loadPackages(root)
+		if loadErr != nil {
+			return loadErr
+		}
+
+		for _, pkg := range pkgs {
+			for _, file := range pkg.Syntax {
+				filename := a.FileSet.Position(file.Pos()).Filename
+				if filename == "" || isTestFile(filename) {
+					continue
+				}
+				absPath, absErr := filepath.Abs(filename)
+				if absErr == nil {
+					filename = absPath
+				}
+				if !isPathInRepo(a.RepoAbs, filename) {
+					continue
+				}
+				if _, exists := fileInfos[filename]; exists {
+					continue
+				}
+				content, readErr := os.ReadFile(filename)
+				if readErr != nil {
+					return readErr
+				}
+				fileInfos[filename] = &fileInfo{
+					file:    file,
+					info:    pkg.TypesInfo,
+					pkg:     pkg.Types,
+					content: content,
 				}
 			}
-		case *ast.FuncDecl:
-			a.visitFuncDecl(x)
 		}
-		return true
-	})
+	}
+
+	// First pass: Collect nodes (Structs, Interfaces, Functions, Methods)
+	for filename, info := range fileInfos {
+		a.collectNodes(filename, info)
+	}
 
 	// Second pass: Collect relationships (Calls)
-	ast.Inspect(f, func(n ast.Node) bool {
-		if fn, ok := n.(*ast.FuncDecl); ok {
-			a.visitFuncBodyForCalls(fn)
-		}
-		return true
-	})
+	for filename, info := range fileInfos {
+		a.collectCalls(filename, info)
+	}
 
 	return nil
 }
 
-// Generate a unique module-like path from the file path relative to repo root
-func (a *GoAnalyzer) getModulePath() string {
-	relPath, err := filepath.Rel(a.RepoPath, a.FilePath)
-	if err != nil {
-		relPath = a.FilePath
+func (a *GoAnalyzer) loadPackages(root string) ([]*packages.Package, error) {
+	cfg := &packages.Config{
+		Mode:  packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedFiles,
+		Dir:   root,
+		Fset:  a.FileSet,
+		Tests: false,
 	}
-	dir := filepath.Dir(relPath)
-	if dir == "." {
-		return a.PackageName
-	}
-	// Convert path separators to dots for ID consistency
-	// e.g. "src/utils" -> "src.utils"
-	// Then append package name so "src/utils" (package "utils") -> "src.utils.utils"
-	// Wait, usually Go module path ends with package name.
-	// Let's just use slash-to-dot replacement of directory + package name.
-	// But to match Tree-sitter behavior in CodeWiki:
-	// It strips extension and uses the file path.
-	// Let's stick to Python implementation: rel_path.replace('/', '.')
-	// But removing extension and potentially filename?
-	// The Python impl uses: module_path = file_path_without_ext.replace('/', '.')
-	// Let's do that for maximum compatibility.
-
-	ext := filepath.Ext(relPath)
-	pathNoExt := relPath[:len(relPath)-len(ext)]
-	return filepath.ToSlash(pathNoExt) // Replace \ with / first on Windows? Text replace is safer.
+	return packages.Load(cfg, "./...")
 }
 
-func (a *GoAnalyzer) getComponentID(name string, receiverType string) string {
+func (a *GoAnalyzer) findModuleRoots() ([]string, error) {
+	if _, err := os.Stat(filepath.Join(a.RepoAbs, "go.work")); err == nil {
+		return []string{a.RepoAbs}, nil
+	}
+
+	roots := []string{}
+	err := filepath.WalkDir(a.RepoAbs, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == ".git" || name == "vendor" || name == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() == "go.mod" {
+			roots = append(roots, filepath.Dir(path))
+		}
+		return nil
+	})
+	return roots, err
+}
+
+func isTestFile(path string) bool {
+	return strings.HasSuffix(path, "_test.go")
+}
+
+type fileInfo struct {
+	file    *ast.File
+	info    *types.Info
+	pkg     *types.Package
+	content []byte
+}
+
+func (a *GoAnalyzer) getComponentIDForFile(filePath string, name string, receiverType string) string {
 	// Mimic CodeWiki's ID generation: module_path.name
 	// models/Node.ID usually is fully qualified.
 
 	// We replace path.Dir separators to dots
-	relPath, _ := filepath.Rel(a.RepoPath, a.FilePath)
+	relPath, _ := filepath.Rel(a.RepoAbs, filePath)
 	ext := filepath.Ext(relPath)
 	pathNoExt := relPath[:len(relPath)-len(ext)]
 	modulePath := ""
@@ -130,7 +173,73 @@ func (a *GoAnalyzer) getComponentID(name string, receiverType string) string {
 	return fmt.Sprintf("%s.%s", modulePath, name)
 }
 
-func (a *GoAnalyzer) visitTypeSpec(ts *ast.TypeSpec, genDeclDoc *ast.CommentGroup) {
+func (a *GoAnalyzer) getComponentIDForPos(pos token.Pos, name string, receiverType string) string {
+	if pos == token.NoPos || a.FileSet == nil {
+		return ""
+	}
+	filename := a.FileSet.Position(pos).Filename
+	if filename == "" {
+		return ""
+	}
+	absPath, err := filepath.Abs(filename)
+	if err == nil {
+		filename = absPath
+	}
+	return a.getComponentIDForFile(filename, name, receiverType)
+}
+
+func (a *GoAnalyzer) isPosInRepo(pos token.Pos) bool {
+	if pos == token.NoPos || a.FileSet == nil {
+		return false
+	}
+	filename := a.FileSet.Position(pos).Filename
+	if filename == "" {
+		return false
+	}
+	absPath, err := filepath.Abs(filename)
+	if err == nil {
+		filename = absPath
+	}
+	return isPathInRepo(a.RepoAbs, filename)
+}
+
+func isPathInRepo(repoAbs string, path string) bool {
+	repoAbs = filepath.Clean(repoAbs)
+	path = filepath.Clean(path)
+	if repoAbs == path {
+		return true
+	}
+	return strings.HasPrefix(path, repoAbs+string(os.PathSeparator))
+}
+
+func (a *GoAnalyzer) collectNodes(filePath string, info *fileInfo) {
+	ast.Inspect(info.file, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.GenDecl:
+			if x.Tok == token.TYPE {
+				for _, spec := range x.Specs {
+					if ts, ok := spec.(*ast.TypeSpec); ok {
+						a.visitTypeSpec(ts, x.Doc, filePath, info.content)
+					}
+				}
+			}
+		case *ast.FuncDecl:
+			a.visitFuncDecl(x, filePath, info.content)
+		}
+		return true
+	})
+}
+
+func (a *GoAnalyzer) collectCalls(filePath string, info *fileInfo) {
+	ast.Inspect(info.file, func(n ast.Node) bool {
+		if fn, ok := n.(*ast.FuncDecl); ok {
+			a.visitFuncBodyForCalls(fn, filePath, info.info, info.pkg)
+		}
+		return true
+	})
+}
+
+func (a *GoAnalyzer) visitTypeSpec(ts *ast.TypeSpec, genDeclDoc *ast.CommentGroup, filePath string, content []byte) {
 	nodeType := "struct"
 	if _, ok := ts.Type.(*ast.InterfaceType); ok {
 		nodeType = "interface"
@@ -140,8 +249,8 @@ func (a *GoAnalyzer) visitTypeSpec(ts *ast.TypeSpec, genDeclDoc *ast.CommentGrou
 		return // Skip other types for now
 	}
 
-	relativePath, _ := filepath.Rel(a.RepoPath, a.FilePath)
-	componentID := a.getComponentID(ts.Name.Name, "")
+	relativePath, _ := filepath.Rel(a.RepoAbs, filePath)
+	componentID := a.getComponentIDForFile(filePath, ts.Name.Name, "")
 
 	startPos := a.FileSet.Position(ts.Pos())
 	endPos := a.FileSet.Position(ts.End())
@@ -162,15 +271,15 @@ func (a *GoAnalyzer) visitTypeSpec(ts *ast.TypeSpec, genDeclDoc *ast.CommentGrou
 	endOffset := endPos.Offset
 
 	var sourceCode string
-	if startOffset >= 0 && endOffset <= len(a.Content) && startOffset <= endOffset {
-		sourceCode = string(a.Content[startOffset:endOffset])
+	if startOffset >= 0 && endOffset <= len(content) && startOffset <= endOffset {
+		sourceCode = string(content[startOffset:endOffset])
 	}
 
 	node := models.Node{
 		ID:            componentID,
 		Name:          ts.Name.Name,
 		ComponentType: "class", // Mapping struct/interface to "class" for CodeWiki compatibility
-		FilePath:      a.FilePath,
+		FilePath:      filePath,
 		RelativePath:  relativePath,
 		StartLine:     startPos.Line,
 		EndLine:       endPos.Line,
@@ -216,8 +325,8 @@ func typeToString(expr ast.Expr) string {
 	}
 }
 
-func (a *GoAnalyzer) visitFuncDecl(fn *ast.FuncDecl) {
-	relativePath, _ := filepath.Rel(a.RepoPath, a.FilePath)
+func (a *GoAnalyzer) visitFuncDecl(fn *ast.FuncDecl, filePath string, content []byte) {
+	relativePath, _ := filepath.Rel(a.RepoAbs, filePath)
 	startPos := a.FileSet.Position(fn.Pos())
 	endPos := a.FileSet.Position(fn.End())
 
@@ -239,11 +348,11 @@ func (a *GoAnalyzer) visitFuncDecl(fn *ast.FuncDecl) {
 			}
 		}
 		className = recvType
-		componentID = a.getComponentID(fn.Name.Name, recvType)
+		componentID = a.getComponentIDForFile(filePath, fn.Name.Name, recvType)
 		displayName = fmt.Sprintf("method %s.%s", recvType, fn.Name.Name)
 	} else {
 		// Regular function
-		componentID = a.getComponentID(fn.Name.Name, "")
+		componentID = a.getComponentIDForFile(filePath, fn.Name.Name, "")
 		displayName = fmt.Sprintf("func %s", fn.Name.Name)
 	}
 
@@ -263,15 +372,15 @@ func (a *GoAnalyzer) visitFuncDecl(fn *ast.FuncDecl) {
 	endOffset := endPos.Offset
 
 	var sourceCode string
-	if startOffset >= 0 && endOffset <= len(a.Content) && startOffset <= endOffset {
-		sourceCode = string(a.Content[startOffset:endOffset])
+	if startOffset >= 0 && endOffset <= len(content) && startOffset <= endOffset {
+		sourceCode = string(content[startOffset:endOffset])
 	}
 
 	node := models.Node{
 		ID:            componentID,
 		Name:          fn.Name.Name,
 		ComponentType: componentType,
-		FilePath:      a.FilePath,
+		FilePath:      filePath,
 		RelativePath:  relativePath,
 		StartLine:     startPos.Line,
 		EndLine:       endPos.Line,
@@ -303,14 +412,15 @@ func (a *GoAnalyzer) visitFuncDecl(fn *ast.FuncDecl) {
 	a.Nodes = append(a.Nodes, node)
 }
 
-func (a *GoAnalyzer) visitFuncBodyForCalls(fn *ast.FuncDecl) {
+func (a *GoAnalyzer) visitFuncBodyForCalls(fn *ast.FuncDecl, filePath string, typeInfo *types.Info, typePkg *types.Package) {
 	if fn.Body == nil {
 		return
 	}
 
 	callerID := ""
+	recvName := ""
+	recvType := ""
 	if fn.Recv != nil {
-		recvType := ""
 		for _, field := range fn.Recv.List {
 			typeStr := typeToString(field.Type)
 			if len(typeStr) > 0 && typeStr[0] == '*' {
@@ -318,21 +428,40 @@ func (a *GoAnalyzer) visitFuncBodyForCalls(fn *ast.FuncDecl) {
 			} else {
 				recvType = typeStr
 			}
+			if len(field.Names) > 0 {
+				recvName = field.Names[0].Name
+			}
 		}
-		callerID = a.getComponentID(fn.Name.Name, recvType)
+		callerID = a.getComponentIDForFile(filePath, fn.Name.Name, recvType)
 	} else {
-		callerID = a.getComponentID(fn.Name.Name, "")
+		callerID = a.getComponentIDForFile(filePath, fn.Name.Name, "")
 	}
 
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		if call, ok := n.(*ast.CallExpr); ok {
-			a.processCall(callerID, call)
+			a.processCall(callerID, recvName, recvType, call, typeInfo, typePkg, filePath)
 		}
 		return true
 	})
 }
 
-func (a *GoAnalyzer) processCall(callerID string, call *ast.CallExpr) {
+func (a *GoAnalyzer) processCall(callerID string, recvName string, recvType string, call *ast.CallExpr, typeInfo *types.Info, typePkg *types.Package, filePath string) {
+	if typeInfo != nil && typePkg != nil {
+		if calleeName, resolved, ok := a.resolveCallWithTypes(call, typeInfo, typePkg); ok {
+			if calleeName != "" {
+				rel := models.CallRelationship{
+					Caller:           callerID,
+					Callee:           calleeName,
+					CallLine:         a.FileSet.Position(call.Pos()).Line,
+					RelationshipType: "calls",
+					IsResolved:       resolved,
+				}
+				a.Relationships = append(a.Relationships, rel)
+			}
+			return
+		}
+	}
+
 	var calleeName string
 
 	switch fun := call.Fun.(type) {
@@ -350,13 +479,18 @@ func (a *GoAnalyzer) processCall(callerID string, call *ast.CallExpr) {
 			// Assumption: Same package/module.
 			// For now, assume it's in the same module path context.
 			// This is "best effort" as noted.
-			calleeName = a.getComponentID(calleeName, "")
+			calleeName = a.getComponentIDForFile(filePath, calleeName, "")
 		}
 
 	case *ast.SelectorExpr:
 		// Method or package call: pkg.Func() or obj.Method()
 		if xIdent, ok := fun.X.(*ast.Ident); ok {
-			calleeName = fmt.Sprintf("%s.%s", xIdent.Name, fun.Sel.Name)
+			// If this is a call on the current method receiver, resolve to method ID.
+			if recvName != "" && recvType != "" && xIdent.Name == recvName {
+				calleeName = a.getComponentIDForFile(filePath, fun.Sel.Name, recvType)
+			} else {
+				calleeName = fmt.Sprintf("%s.%s", xIdent.Name, fun.Sel.Name)
+			}
 		}
 	}
 
@@ -370,6 +504,80 @@ func (a *GoAnalyzer) processCall(callerID string, call *ast.CallExpr) {
 		}
 		a.Relationships = append(a.Relationships, rel)
 	}
+}
+
+func (a *GoAnalyzer) resolveCallWithTypes(call *ast.CallExpr, typeInfo *types.Info, typePkg *types.Package) (string, bool, bool) {
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		obj := typeInfo.Uses[fun]
+		switch fn := obj.(type) {
+		case *types.Func:
+			calleeName := a.getComponentIDForPos(fn.Pos(), fn.Name(), "")
+			if calleeName != "" && a.isPosInRepo(fn.Pos()) {
+				return calleeName, a.CollectedNodeIDs[calleeName], true
+			}
+			if fn.Pkg() != nil {
+				return fmt.Sprintf("%s.%s", fn.Pkg().Name(), fn.Name()), false, true
+			}
+			return fn.Name(), false, true
+		case *types.Builtin:
+			return fun.Name, false, true
+		default:
+			return "", false, false
+		}
+
+	case *ast.SelectorExpr:
+		if sel := typeInfo.Selections[fun]; sel != nil {
+			if fn, ok := sel.Obj().(*types.Func); ok {
+				recvType := receiverTypeString(fn.Type())
+				calleeName := a.getComponentIDForPos(fn.Pos(), fn.Name(), recvType)
+				if calleeName != "" && a.isPosInRepo(fn.Pos()) {
+					return calleeName, a.CollectedNodeIDs[calleeName], true
+				}
+				// External method call on a value; fall back to a type-qualified name.
+				recvStr := types.TypeString(sel.Recv(), func(pkg *types.Package) string {
+					if pkg == typePkg {
+						return ""
+					}
+					return pkg.Name()
+				})
+				return fmt.Sprintf("%s.%s", recvStr, fn.Name()), false, true
+			}
+			return "", false, false
+		}
+
+		if xIdent, ok := fun.X.(*ast.Ident); ok {
+			if _, ok := typeInfo.Uses[xIdent].(*types.PkgName); ok {
+				if obj := typeInfo.Uses[fun.Sel]; obj != nil {
+					if fn, ok := obj.(*types.Func); ok {
+						calleeName := a.getComponentIDForPos(fn.Pos(), fn.Name(), "")
+						if calleeName != "" && a.isPosInRepo(fn.Pos()) {
+							return calleeName, a.CollectedNodeIDs[calleeName], true
+						}
+						return fmt.Sprintf("%s.%s", xIdent.Name, fn.Name()), false, true
+					}
+				}
+			}
+		}
+	}
+
+	return "", false, false
+}
+
+func receiverTypeString(t types.Type) string {
+	sig, ok := t.(*types.Signature)
+	if !ok {
+		return ""
+	}
+	recv := sig.Recv()
+	if recv == nil {
+		return ""
+	}
+	recvType := recv.Type()
+	if ptr, ok := recvType.(*types.Pointer); ok {
+		recvType = ptr.Elem()
+	}
+	return types.TypeString(recvType, func(pkg *types.Package) string { return "" })
 }
 
 func isBuiltin(name string) bool {

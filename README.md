@@ -9,7 +9,7 @@
   - Structs and Interfaces (mapped to "class" components)
   - Functions and Methods
   - Source code segments (including documentation comments)
-- **Call Graph Generation**: Extracts function call relationships within the analyzed file.
+- **Call Graph Generation**: Extracts function call relationships across the repository (non-test files).
 - **JSON Output**: Produces structured JSON output suitable for integration with other tools (e.g., Python parsers).
 
 ## Installation
@@ -29,23 +29,22 @@ This will create a `codewiki-go-analyzer` executable in the current directory.
 
 ## Usage
 
-`codewiki-go-analyzer` is a command-line tool.
+`codewiki-go-analyzer` is a command-line tool. The repository should be a Go module (with `go.mod`) or use a `go.work` file at the root.
 
 ```bash
-./codewiki-go-analyzer -file <path_to_go_file> [-repo <path_to_repo_root>]
+./codewiki-go-analyzer -repo <path_to_repo_root>
 ```
 
 ### Arguments
 
-| Flag    | Required | Description                                                                   |
-| ------- | -------- | ----------------------------------------------------------------------------- |
-| `-file` | Yes      | Absolute or relative path to the Go file to analyze.                          |
-| `-repo` | No       | Path to the repository root. Used to calculate relative paths for components. |
+| Flag    | Required | Description                                  |
+| ------- | -------- | -------------------------------------------- |
+| `-repo` | Yes      | Path to the repository root to analyze.       |
 
 ### Example
 
 ```bash
-./codewiki-go-analyzer -file ./analyzer/analyzer.go -repo .
+./codewiki-go-analyzer -repo .
 ```
 
 ## Output Format
@@ -97,8 +96,8 @@ The tool outputs a JSON object to `stdout` containing two main arrays: `nodes` a
 In the CodeWiki Python backend, `codewiki-go-analyzer` is invoked via `subprocess`. The wrapper implementation can be found in `codewiki/src/be/dependency_analyzer/analyzers/go.py`.
 
 It treats `codewiki-go-analyzer` as a black-box parser:
-1. Python detects a `.go` file.
-2. Python executes `codewiki-go-analyzer` with the file path.
+1. Python detects a Go repository.
+2. Python executes `codewiki-go-analyzer` with the repository root.
 3. `codewiki-go-analyzer` analyzes the file and prints JSON to stdout.
 4. Python captures stdout, deserializes the JSON, and integrates the nodes into the global dependency graph.
 
